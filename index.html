@@ -1,0 +1,1345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbit to Surface</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #c, #hud { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #hud { pointer-events: none; }
+  #err { position: fixed; left: 16px; top: 16px; right: 16px; color: #f88; font: 13px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="hud"></canvas>
+<div id="err"></div>
+<script>
+const SCENE_FS = `#version 300 es
+precision highp float;
+precision highp int;
+precision highp sampler3D;
+uniform vec2  uRes;
+uniform vec2  uJitter;
+uniform vec3  uCamPos;
+uniform mat3  uCam;        // columns: right, up, forward
+uniform float uTanFov;     // tan(half vertical fov)
+uniform vec3  uSun;
+uniform float uTime;
+uniform float uPix;        // angle of one pixel, radians
+uniform float uFrame;
+uniform int   uSteps;
+uniform int   uShadowSteps;
+uniform int   uCloudSteps, uAtmoSteps;
+uniform vec3  uHoleA, uHoleB;   // ends of the gap the camera dives through, on the sea-level sphere
+uniform sampler3D uNoise;
+out vec4 outColor;
+
+// ---- shared constants, noise and the planet's height field (km units) ----
+const float R    = 600.0;   // sea-level radius
+const float RA   = 680.0;   // top of atmosphere
+const float HMAX = 7.0;     // no terrain above this
+const float CLO  = 2.4;     // cloud shell, above sea level
+const float CHI  = 5.6;
+const float PI   = 3.14159265;
+const mat3  M3   = mat3(0.00, 0.80, 0.60, -0.80, 0.36, -0.48, -0.60, -0.48, 0.64);
+
+uint hu(uvec3 x) {
+  x *= uvec3(1597334673u, 3812015801u, 2798796415u);
+  uint h = x.x ^ x.y ^ x.z;
+  h ^= h >> 15; h *= 2246822519u;
+  h ^= h >> 13; h *= 3266489917u;
+  h ^= h >> 16;
+  return h;
+}
+float h1(ivec3 p) { return float(hu(uvec3(p)) >> 8) * (1.0 / 16777216.0); }
+
+// value noise in [-1,1]
+float noise(vec3 x) {
+  vec3 i = floor(x), f = x - i; ivec3 p = ivec3(i);
+  vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  float a = h1(p), b = h1(p + ivec3(1,0,0)), c = h1(p + ivec3(0,1,0)), d = h1(p + ivec3(1,1,0));
+  float e = h1(p + ivec3(0,0,1)), g = h1(p + ivec3(1,0,1)), h = h1(p + ivec3(0,1,1)), k = h1(p + ivec3(1,1,1));
+  return -1.0 + 2.0 * mix(mix(mix(a, b, u.x), mix(c, d, u.x), u.y), mix(mix(e, g, u.x), mix(h, k, u.x), u.y), u.z);
+}
+
+// value noise in [-1,1] with analytic gradient in yzw
+vec4 noised(vec3 x) {
+  vec3 i = floor(x), f = x - i; ivec3 p = ivec3(i);
+  vec3 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  vec3 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+  float a = h1(p), b = h1(p + ivec3(1,0,0)), c = h1(p + ivec3(0,1,0)), d = h1(p + ivec3(1,1,0));
+  float e = h1(p + ivec3(0,0,1)), g = h1(p + ivec3(1,0,1)), h = h1(p + ivec3(0,1,1)), k = h1(p + ivec3(1,1,1));
+  float k0 = a, k1 = b - a, k2 = c - a, k3 = e - a;
+  float k4 = a - b - c + d, k5 = a - c - e + h, k6 = a - b - e + g, k7 = -a + b + c - d + e - g - h + k;
+  return vec4(
+    -1.0 + 2.0 * (k0 + k1*u.x + k2*u.y + k3*u.z + k4*u.x*u.y + k5*u.y*u.z + k6*u.z*u.x + k7*u.x*u.y*u.z),
+    2.0 * du * vec3(k1 + k4*u.y + k6*u.z + k7*u.y*u.z,
+                    k2 + k5*u.z + k4*u.x + k7*u.z*u.x,
+                    k3 + k6*u.x + k5*u.y + k7*u.x*u.y));
+}
+
+const float MTN = 4.6, DAMP = 0.6, RIDGE = 0.7;   // mountain height (km), how strongly slopes mute finer detail
+// continents: > 0 is land. q is a point on the sea-level sphere.
+float continent(vec3 q) {
+  vec3 s = q * (1.0 / 300.0) + vec3(3.1, 7.7, 1.3);
+  float c = 0.0, a = 0.5;
+  for (int i = 0; i < 5; i++) { c += a * noise(s); s = M3 * s * 2.02; a *= 0.5; }
+  return c + 0.04;
+}
+
+// height above sea level in km. oct = how many detail octaves (fractional).
+// y = altitude of the point asking: once the ground provably lies well below it, stop early and
+// return that upper bound (still a safe distance for the ray march). Pass -1e9 for the exact height.
+float terrainY(vec3 p, float oct, float y) {
+  vec3 q = normalize(p) * R;
+  float c = continent(q);
+  float base = c > 0.0 ? c * 1.5 : c * 5.0;
+  if (c < -0.12) return base;
+  float land = smoothstep(-0.12, 0.10, c);
+  float mm = smoothstep(-0.25, 0.45, noise(q * (1.0 / 110.0) + vec3(40.0)));
+  float mount = smoothstep(-0.03, 0.07, c) * mm * mm;
+  float amp = land * (0.25 + MTN * mount);
+  base -= land * 0.2;
+  vec3 s = q * (1.0 / 16.0);
+  float a = 0.0, b = 1.0; vec3 dd = vec3(0.0);
+  for (int i = 0; i < 14; i++) {
+    float w = clamp(oct - float(i), 0.0, 1.0);
+    if (w <= 0.0) break;
+    // every later octave adds at most its weight, so a + 2b bounds the final sum
+    float hi = base + amp * (a + 2.0 * b);
+    if (y - hi > 0.6 * (y - base - amp * a)) return hi;
+    vec4 n = noised(s);
+    // ridged: crests where the noise crosses zero (rounded a little, so the slope stays continuous)
+    float sa = sqrt(n.x * n.x + 0.012), rg = 1.0 - sa, sm = 0.5 + 0.5 * n.x;
+    dd += n.yzw * (w * DAMP * mix(0.5, -2.0 * rg * n.x / sa, RIDGE));
+    a += w * b * mix(sm, rg * rg, RIDGE) / (1.0 + dot(dd, dd));
+    b *= 0.5; s = M3 * s * 2.0;
+  }
+  return base + amp * a;
+}
+float terrain(vec3 p, float oct) { return terrainY(p, oct, -1e9); }
+
+// ray / sphere centred on the origin. returns (near, far) or (-1,-1).
+vec2 sphere(vec3 ro, vec3 rd, float r) {
+  float l = length(ro);
+  float b = dot(ro, rd), c = (l - r) * (l + r), h = b * b - c;
+  if (h < 0.0) return vec2(-1.0);
+  h = sqrt(h);
+  return vec2(-b - h, -b + h);
+}
+
+// ---- atmosphere: single scattering, Rayleigh + Mie + ozone ----
+const float HR = 8.0, HM = 1.3;
+const vec3  BR = vec3(5.8e-3, 13.5e-3, 33.1e-3) * 2.2;
+const float BM = 4.0e-3 * 1.8;
+const vec3  BO = vec3(0.65e-3, 1.88e-3, 0.085e-3) * 2.2;
+const float SUN_I = 22.0;
+
+vec3 density(float h) {
+  h = max(h, 0.0);
+  return vec3(exp(-h / HR), exp(-h / HM), max(0.0, 1.0 - abs(h - 25.0) / 15.0));
+}
+
+vec3 extinction(vec3 od) { return exp(-(BR * od.x + BM * 1.1 * od.y + BO * od.z)); }
+
+// how much of the planet's body blocks the sun at p (0 = night, 1 = lit)
+float planetShadow(vec3 p) {
+  float s = dot(p, uSun);
+  if (s > 0.0) return 1.0;
+  float d = length(p - uSun * s);
+  return smoothstep(R - 3.0, R + 1.0, d);
+}
+
+// optical depth from p to the sun, through the atmosphere
+vec3 sunDepth(vec3 p) {
+  float t1 = sphere(p, uSun, RA).y;
+  const int N = 5;
+  vec3 od = vec3(0.0); float t = 0.0;
+  for (int i = 0; i < N; i++) {
+    // steps grow away from p, where the air is thin
+    float tn = t1 * pow(float(i + 1) / float(N), 2.0);
+    float tm = 0.5 * (t + tn);
+    od += density(length(p + uSun * tm) - R) * (tn - t);
+    t = tn;
+  }
+  return od;
+}
+
+// colour of direct sunlight arriving at p
+vec3 sunLight(vec3 p) { return SUN_I * extinction(sunDepth(p)) * planetShadow(p); }
+
+// in-scattered light and transmittance along ro + rd * [ta, tb]
+void scatter(vec3 ro, vec3 rd, float ta, float tb, int n, float jit, inout vec3 S, inout vec3 T) {
+  if (tb <= ta) return;
+  float mu = dot(rd, uSun);
+  float pr = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+  const float g = 0.76;
+  float pm = 3.0 / (8.0 * PI) * ((1.0 - g * g) * (1.0 + mu * mu)) / ((2.0 + g * g) * pow(1.0 + g * g - 2.0 * g * mu, 1.5));
+  float dt = (tb - ta) / float(n);
+  for (int i = 0; i < n; i++) {
+    vec3 p = ro + rd * (ta + (float(i) + jit) * dt);
+    vec3 d = density(length(p) - R);
+    vec3 sig = BR * d.x + BM * 1.1 * d.y + BO * d.z;       // extinction here
+    vec3 stepT = exp(-sig * dt);
+    vec3 L = sunLight(p);
+    // small isotropic term stands in for multiple scattering
+    vec3 src = L * (BR * d.x * pr + BM * d.y * pm) + L * (BR * d.x + BM * d.y) * 0.035;
+    // skylight scattered a second time keeps the upper sky blue at sunset
+    float e = dot(p, uSun) / length(p);
+    src += vec3(0.06, 0.14, 0.36) * (SUN_I * 0.008) * smoothstep(-0.12, 0.25, e) * BR * d.x / BR.b;
+    // energy-conserving integration over the step
+    S += T * src * (1.0 - stepT) / max(sig, vec3(1e-7));
+    T *= stepT;
+  }
+}
+
+// ---- volumetric clouds in a shell between CLO and CHI ----
+// uNoise is a 64^3 tiling noise volume built at start-up from the same hash.
+vec4 tn(vec3 p) {
+  p *= 64.0;
+  vec3 i = floor(p), f = p - i;
+  f = f * f * (3.0 - 2.0 * f);
+  return textureLod(uNoise, (i + f + 0.5) / 64.0, 0.0);   // explicit LOD: safe inside loops on Direct3D
+}
+
+// The GPU blends texels with only 8 bits of weight, which turns slow noise into stairs 1/256 of a cell wide.
+// Where one cell spans kilometres, blend the eight corners here instead, at full precision.
+vec4 tnp(vec3 p) {
+  p *= 64.0;
+  vec3 i = floor(p), f = p - i;
+  f = f * f * (3.0 - 2.0 * f);
+  ivec3 a = ivec3(i) & 63, b = (a + 1) & 63;
+  vec4 x0 = mix(texelFetch(uNoise, a, 0), texelFetch(uNoise, ivec3(b.x, a.y, a.z), 0), f.x);
+  vec4 x1 = mix(texelFetch(uNoise, ivec3(a.x, b.y, a.z), 0), texelFetch(uNoise, ivec3(b.x, b.y, a.z), 0), f.x);
+  vec4 x2 = mix(texelFetch(uNoise, ivec3(a.x, a.y, b.z), 0), texelFetch(uNoise, ivec3(b.x, a.y, b.z), 0), f.x);
+  vec4 x3 = mix(texelFetch(uNoise, ivec3(a.x, b.y, b.z), 0), texelFetch(uNoise, b, 0), f.x);
+  return mix(mix(x0, x1, f.y), mix(x2, x3, f.y), f.z);
+}
+
+// sky light that fills shadows; fades through the terminator
+vec3 ambient(vec3 p) {
+  float e = dot(normalize(p), uSun);
+  vec3 day = vec3(0.42, 0.62, 1.0) * 0.55;
+  vec3 dusk = vec3(0.55, 0.42, 0.62) * 0.16;
+  return mix(dusk, day, smoothstep(0.0, 0.35, e)) * smoothstep(-0.22, 0.05, e);
+}
+
+// large weather systems: x = cover 0..1, y = how high the tops reach (fraction of the shell)
+vec2 cloudCover(vec3 p) {
+  vec3 s = p * (1.0 / 5200.0) + vec3(0.31, 0.77, 0.13);   // one noise cell = 80 km
+  vec4 w = tnp(s * 0.7 + 0.37);
+  s += (w.xyz - 0.5) * 0.07;
+  s += (tnp(s * 3.1 + 0.61).yzx - 0.5) * 0.022;
+  float n2 = tnp(s * 2.3 + 0.2).g, n5 = tnp(s * 5.1).b;
+  float c = tnp(s).r * 0.34 + n2 * 0.24 + n5 * 0.18
+          + tn(s * 11.7 + 0.4).a * 0.14 + tn(s * 27.0).r * 0.10;
+  // the dive goes down a well in the cloud deck: thin the cover along that stretch of the path
+  vec3 q = normalize(p) * R, ab = uHoleB - uHoleA;
+  float hd = length(q - uHoleA - ab * clamp(dot(q - uHoleA, ab) / dot(ab, ab), 0.0, 1.0));
+  c -= 0.30 * (1.0 - smoothstep(3.0, 15.0, hd));
+  // tops rise and fall over tens of kilometres, so a distant deck has a skyline instead of a ruled edge
+  return vec2(smoothstep(0.46, 0.62, c), mix(0.45, 1.0, smoothstep(0.40, 0.60, 0.5 * (n2 + n5))));
+}
+float cloudDensity(vec3 p, vec2 cv, float lod) {
+  float cov = cv.x;
+  float h = (length(p) - R - CLO) / (CHI - CLO) / cv.y;
+  if (h < 0.0 || h > 1.0 || cov < 0.01) return 0.0;
+  float prof = smoothstep(0.0, 0.12, h) * smoothstep(1.0, 0.25 + 0.55 * cov, h);
+  // height counts four-fold in the lookup, so the shapes billow instead of being extruded straight up
+  vec3 q = normalize(p) * (R + (length(p) - R) * 4.0) * (1.0 / 800.0) + vec3(uTime * 2e-5, 0.0, uTime * 1e-5);
+  // lod: 1 = near (exact blend, fine detail), 0 = far, -1 = light march. The light march multiplies small steps in
+  // density into visible contour lines of shadow, so it needs the exact blend as well.
+  float b = abs(lod) > 0.5 ? tnp(q).g * 0.62 + tnp(q * 2.03 + 0.11).r * 0.38 : tn(q).g * 0.62 + tn(q * 2.03 + 0.11).r * 0.38;
+  float d = b * prof - mix(0.80, 0.40, cov);
+  if (d <= -0.08) return 0.0;
+  if (lod > 0.5) {
+    // fine noise eats the edges and leaves the cores solid
+    float e = tn(q * 5.3 + 0.23).b * 0.6 + tn(q * 13.7).a * 0.4;
+    d -= (1.0 - e) * 0.16 * (1.0 - smoothstep(0.0, 0.25, d)) - 0.05;
+  }
+  return clamp(d * 7.0, 0.0, 1.0);
+}
+
+// returns premultiplied colour + alpha; tc is the opacity-weighted depth
+vec4 clouds(vec3 ro, vec3 rd, float tEnd, float jit, out float tc) {
+  tc = tEnd;
+  vec2 o = sphere(ro, rd, R + CHI), n = sphere(ro, rd, R + CLO);
+  if (o.y < 0.0) return vec4(0.0);
+  float l = length(ro) - R;
+  float ta, tb;
+  if (l > CHI)      { ta = o.x; tb = n.x > 0.0 ? n.x : o.y; }
+  else if (l > CLO) { ta = 0.0; tb = n.x > 0.0 ? n.x : o.y; }
+  else              { ta = n.y; tb = o.y; }
+  tb = min(tb, tEnd);
+  tb = min(tb, ta + 260.0);
+  if (tb <= ta) return vec4(0.0);
+
+  float len = tb - ta;
+  int N = uCloudSteps;
+  // step length grows in proportion to distance from the eye: fine up close, even across a far-off deck
+  const float T0 = 1.5;
+  float k = log((tb + T0) / (ta + T0));
+  float mu = dot(rd, uSun);
+  float ph = mix(0.9 * (1.0 - 0.36) / pow(1.36 - 1.2 * mu, 1.5), 1.0, 0.45) / (4.0 * PI) * 1.9;
+
+  vec3 col = vec3(0.0); float T = 1.0, wsum = 0.0, tsum = 0.0;
+  vec3 Ls = vec3(0.0), La = vec3(0.0); bool lit = false;
+  float tPrev = ta, tLast = ta; bool inside = false; int entries = 0;
+  for (int i = 0; i < N; i++) {
+    float x = (float(i) + jit) / float(N);
+    float t = (ta + T0) * exp(k * x) - T0;
+    float xn = float(i + 1) / float(N);
+    float tNext = (ta + T0) * exp(k * xn) - T0;
+    float ds = tNext - tPrev; tPrev = tNext;
+    vec3 p = ro + rd * t;
+    vec2 cov = cloudCover(p);
+    float lod = t < 90.0 ? 1.0 : 0.0;
+    float d = cloudDensity(p, cov, lod);
+    if (d > 0.002) {
+      if (!lit) { Ls = sunLight(p); La = ambient(p); lit = true; }
+      // Entering a cloud: how deep this sample landed is an accident of the step grid, and far away a step is
+      // kilometres long, so shading it there draws the grid on the cloud as rings and dots. Find the surface
+      // between the last two samples and walk in from it instead, in four slices that start thin.
+      // Only the first two clouds along a ray get this: they are the ones in view, and it costs about fifteen steps.
+      int M = 1; float tS = t, L = t - tLast;
+      if (!inside && T > 0.2 && L > 0.25 && entries < 2) {
+        entries++;
+        float a0 = tLast, b0 = t;
+        for (int j = 0; j < 8; j++) {
+          float m = 0.5 * (a0 + b0); vec3 pm = ro + rd * m;
+          if (cloudDensity(pm, cloudCover(pm), lod) > 0.002) b0 = m; else a0 = m;
+        }
+        tS = b0; M = 4;
+      }
+      inside = true;
+      for (int m = 0; m < M; m++) {
+        vec3 pl = p; vec2 cl = cov; float dd = d, seg = min(ds, 2.0), tt = t;
+        if (M > 1) {
+          float e0 = float(m * m) / 16.0, e1 = float((m + 1) * (m + 1)) / 16.0;
+          tt = tS + L * 0.5 * (e0 + e1); pl = ro + rd * tt;
+          cl = cloudCover(pl); dd = cloudDensity(pl, cl, lod);
+          // long slices are capped for the same reason as long steps: the cloud in them is thinner than they are
+          seg = min(L * (e1 - e0), 1.0);
+          if (dd <= 0.002) continue;
+        }
+        // light march toward the sun
+        float od = 0.0, st = 0.12;
+        for (int j = 0; j < 4; j++) {
+          od += cloudDensity(pl + uSun * st * 1.6, cl, -1.0) * st * 2.0;
+          st *= 2.1;
+        }
+        float beer = exp(-od * 5.0) + 0.35 * exp(-od * 1.1);
+        float hgt = clamp((length(pl) - R - CLO) / (CHI - CLO), 0.0, 1.0);
+        vec3 L1 = Ls * beer * ph * (1.0 - exp(-dd * 6.0 - 0.3)) + La * (0.35 + 0.65 * hgt)
+                + Ls * 0.05 * (0.3 + 0.7 * hgt);     // light that has bounced around inside the cloud
+        // far steps are kilometres long but the cloud in them is not: capping the length keeps thin cloud translucent
+        // there instead of flickering between solid and absent from pixel to pixel
+        float a = 1.0 - exp(-dd * seg * 9.0);
+        col += T * a * L1;
+        wsum += T * a; tsum += T * a * tt;
+        T *= 1.0 - a;
+        if (T < 0.015) break;
+      }
+      if (T < 0.015) break;
+    } else inside = false;
+    tLast = t;
+  }
+  if (wsum > 0.0) tc = tsum / wsum;
+  return vec4(col, 1.0 - T);
+}
+
+// ---- terrain marching, land and ocean shading ----
+float octFor(float t, float k) { return clamp(log2(16.0 / (max(t, 0.01) * uPix * k)), 2.0, 14.0); }
+
+float march(vec3 ro, vec3 rd, float ta, float tb) {
+  float t = ta, lh = 0.0, lt = ta;
+  for (int i = 0; i < uSteps; i++) {
+    vec3 p = ro + rd * t;
+    float y = length(p) - R;
+    float h = y - terrainY(p, octFor(t, 3.0), y);
+    if (h < 0.0004 * t) {
+      if (h < 0.0 && lh > 0.0) t = lt + (t - lt) * lh / (lh - h);
+      return t;
+    }
+    lh = h; lt = t;
+    t += max(h * 0.42, t * 0.0007);
+    if (t > tb) return -1.0;
+  }
+  return t;
+}
+
+vec3 calcNormal(vec3 p, float t) {
+  float e = max(0.0012, t * uPix);
+  float oc = octFor(t, 0.6);
+  vec3 up = normalize(p);
+  vec3 tx = normalize(cross(up, vec3(0.31, 0.87, 0.38)));
+  vec3 tz = cross(up, tx);
+  float hx = terrain(p + tx * e, oc) - terrain(p - tx * e, oc);
+  float hz = terrain(p + tz * e, oc) - terrain(p - tz * e, oc);
+  return normalize(up * 2.0 * e - tx * hx - tz * hz);
+}
+
+float shadow(vec3 p, float t) {
+  float res = 1.0, s = 0.02 + 0.004 * t;
+  for (int i = 0; i < uShadowSteps; i++) {
+    vec3 q = p + uSun * s;
+    float a = length(q) - R;
+    if (a > HMAX) break;
+    float h = a - terrainY(q, octFor(t + s, 8.0), a);
+    res = min(res, 9.0 * h / s);
+    if (res < 0.005) break;
+    s += clamp(h * 0.7, 0.03 + 0.01 * t, 4.0);
+  }
+  return smoothstep(0.0, 1.0, res);
+}
+
+float cloudShadow(vec3 p) {
+  float ts = sphere(p, uSun, R + 0.5 * (CLO + CHI)).y;
+  vec3 pc = p + uSun * ts;
+  float d = cloudDensity(pc, cloudCover(pc), 0.0);
+  return mix(1.0, exp(-d * 5.0), smoothstep(-0.05, 0.1, dot(normalize(p), uSun)));
+}
+
+vec3 shadeLand(vec3 p, float t) {
+  vec3 n = calcNormal(p, t);
+  vec3 up = normalize(p), q = up * R;
+  float h = length(p) - R, slope = dot(n, up), lat = abs(up.y);
+  vec4 v1 = tnp(q * (1.0 / 6000.0)), v2 = tn(q * (1.0 / 60.0) + 0.4);
+  float moist = v1.r * 0.7 + v1.g * 0.3;
+  vec3 veg = mix(vec3(0.19, 0.27, 0.07), vec3(0.045, 0.11, 0.035), smoothstep(0.35, 0.65, v2.r));
+  vec3 dry = mix(vec3(0.58, 0.40, 0.24), vec3(0.50, 0.44, 0.30), v2.g);
+  vec3 rock = mix(vec3(0.26, 0.23, 0.21), vec3(0.36, 0.31, 0.27), v2.b);
+  vec3 c = mix(dry, veg, smoothstep(0.42, 0.56, moist));
+  c = mix(c, rock, smoothstep(1.0, 2.4, h + (v2.a - 0.5) * 0.8));
+  c = mix(c, rock, smoothstep(0.86, 0.66, slope));
+  c = mix(c, vec3(0.62, 0.53, 0.38), smoothstep(0.035, 0.006, h));
+  float line = mix(2.7, -0.4, smoothstep(0.55, 0.92, lat)) + (v2.r - 0.5) * 0.7;
+  float sn = smoothstep(line, line + 0.45, h) * smoothstep(0.50, 0.72, slope);
+  c = mix(c, vec3(0.88, 0.91, 0.97), sn);
+
+  float ndl = max(dot(n, uSun), 0.0);
+  float sh = ndl > 0.0 ? shadow(p, t) * cloudShadow(p) : 0.0;
+  vec3 L = sunLight(p);
+  vec3 col = c * (L * ndl * sh / PI + ambient(p) * (0.35 + 0.65 * slope) / PI * 1.6);
+  // snow sparkle / wet sand keep a little specular
+  vec3 hv = normalize(uSun - normalize(p - uCamPos));
+  col += L * sh * sn * 0.08 * pow(max(dot(n, hv), 0.0), 40.0);
+  return col;
+}
+
+vec3 shadeOcean(vec3 p, vec3 rd, float t) {
+  vec3 up = normalize(p);
+  float fp = t * uPix;
+  vec3 g = vec3(0.0); float f = 3.0, a = 1.0, lost = 0.0;
+  for (int i = 0; i < 6; i++) {
+    float keep = smoothstep(1.2 * fp, 5.0 * fp, 1.0 / f);
+    lost += a * (1.0 - keep);
+    if (keep > 0.0) g += noised(p * f + vec3(uTime * 0.35 * sqrt(1.0 / f) * f, 0.0, uTime * 0.2)).yzw * a * keep;
+    f *= 2.6; a *= 0.66;
+  }
+  g -= up * dot(g, up);
+  vec3 n = normalize(up - g * 0.05);
+  float ndv = max(dot(n, -rd), 0.0);
+  float F = 0.02 + 0.98 * pow(1.0 - ndv, 5.0);
+  F *= 1.0 - 0.5 * clamp(lost * 0.35, 0.0, 1.0);          // rough far water reflects less at grazing angles
+
+  float depth = -terrain(p, 6.0);
+  vec3 L = sunLight(p);
+  float cs = cloudShadow(p);
+  float sh = (t < 250.0 ? shadow(p, t) : 1.0) * cs;
+  float ndl = max(dot(up, uSun), 0.0);
+  vec3 deep = vec3(0.006, 0.045, 0.10), shallow = vec3(0.03, 0.30, 0.30);
+  vec3 body = mix(shallow, deep, 1.0 - exp(-max(depth, 0.0) / 0.045));
+  body = mix(body, vec3(0.45, 0.42, 0.30), 0.6 * exp(-max(depth, 0.0) / 0.006));
+  vec3 col = body * (L * ndl * sh / PI + ambient(p) / PI * 1.6);
+
+  // reflected sky
+  vec3 rf = reflect(rd, n);
+  rf = normalize(rf + up * max(0.0, 0.02 - dot(rf, up)));
+  vec3 S = vec3(0.0), T = vec3(1.0);
+  scatter(p + up * 0.01, rf, 0.0, sphere(p, rf, RA).y, 6, 0.5, S, T);
+  col = mix(col, S, F);
+
+  // sun glitter
+  float rough = 0.045 + 0.10 * clamp(lost * 0.3, 0.0, 1.0);
+  vec3 hv = normalize(uSun - rd);
+  float ndh = max(dot(n, hv), 0.0), a2 = rough * rough;
+  float D = a2 / (PI * pow(ndh * ndh * (a2 - 1.0) + 1.0, 2.0));
+  float Fs = 0.02 + 0.98 * pow(1.0 - max(dot(hv, -rd), 0.0), 5.0);
+  col += L * sh * D * Fs * 0.25 / max(ndv, 0.12) * step(0.0, dot(up, uSun));
+
+  // surf line
+  float foam = smoothstep(0.006, 0.0, depth) * smoothstep(0.35, 0.75, tn(p * 0.9).r + 0.25);
+  col = mix(col, vec3(0.85) * (L * ndl * sh / PI + ambient(p) / PI * 1.6), foam * 0.8);
+  return col;
+}
+
+// ---- one ray per pixel: space, air, cloud, land, sea ----
+vec3 stars(vec3 rd) {
+  vec3 p = rd * 190.0; ivec3 c = ivec3(floor(p));
+  float h = h1(c);
+  if (h < 0.990) return vec3(0.0);
+  vec3 off = vec3(h1(c + 7), h1(c + 13), h1(c + 29)) - 0.5;
+  float d = length(p - floor(p) - 0.5 - off * 0.6);
+  float b = (h - 0.990) / 0.010; b = 0.25 + 9.0 * b * b * b;
+  vec3 tint = mix(vec3(1.0, 0.82, 0.66), vec3(0.72, 0.84, 1.0), h1(c + 41));
+  return tint * b * smoothstep(0.11, 0.0, d);
+}
+
+vec3 sunDisk(vec3 rd) {
+  float mu = dot(rd, uSun);
+  float x = acos(clamp(mu, -1.0, 1.0)) / 0.0085;
+  if (x > 1.0) return vec3(0.0);
+  float limb = 0.45 + 0.55 * sqrt(1.0 - x * x);
+  return vec3(1.0, 0.96, 0.90) * 2600.0 * limb * smoothstep(1.0, 0.9, x);
+}
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy + uJitter - 0.5 * uRes) / uRes.y * 2.0 * uTanFov;
+  vec3 rd = normalize(uCam * vec3(uv, 1.0));
+  vec3 ro = uCamPos;
+  // where along each step the samples sit, shifted every frame. Air is smooth, so it takes a regular dither
+  // (interleaved gradient noise) that the eye barely sees. Clouds have surfaces, and a regular dither beats against
+  // them and draws fringes, so they get a random offset per pixel instead.
+  vec2 fc = gl_FragCoord.xy + 5.588238 * mod(uFrame, 64.0);
+  float jitA = fract(52.9829189 * fract(0.06711056 * fc.x + 0.00583715 * fc.y));
+  float jit = h1(ivec3(gl_FragCoord.xy, int(uFrame)));
+
+  // daylight drowns the stars: they belong to the view from above the air
+  vec3 bg = stars(rd) * smoothstep(8.0, 70.0, length(uCamPos) - R) + sunDisk(rd);
+  vec2 atm = sphere(ro, rd, RA);
+  if (atm.y < 0.0) { outColor = vec4(bg, 1.0); return; }
+  float tA = max(atm.x, 0.0), tEnd = atm.y;
+
+  float alt = length(ro) - R;
+  vec2 oc = sphere(ro, rd, R), sh = sphere(ro, rd, R + HMAX);
+  float tO = oc.x > 0.0 ? oc.x : -1.0;
+  int kind = 0; float tHit = 0.0;
+  if (sh.y > 0.0) {
+    float ta = alt > HMAX ? sh.x : 0.0;
+    float tb = tO > 0.0 ? tO : sh.y;
+    float tm = march(ro, rd, ta, tb);
+    if (tm > 0.0) { kind = 1; tHit = tm; }
+    else if (tO > 0.0) { kind = 2; tHit = tO; }
+  }
+
+  vec3 surf = bg;
+  if (kind == 1) surf = shadeLand(ro + rd * tHit, tHit);
+  if (kind == 2) surf = shadeOcean(ro + rd * tHit, rd, tHit);
+  if (kind > 0) tEnd = tHit;
+
+  float tc;
+  vec4 cl = clouds(ro, rd, tEnd, jit, tc);
+  vec3 S = vec3(0.0), T = vec3(1.0), col;
+  if (cl.a > 0.003) {
+    tc = clamp(tc, tA, tEnd);
+    scatter(ro, rd, tA, tc, uAtmoSteps / 2, jitA, S, T);
+    vec3 S2 = vec3(0.0), T2 = vec3(1.0);
+    scatter(ro, rd, tc, tEnd, uAtmoSteps / 2, jitA, S2, T2);
+    col = S + T * (cl.rgb + (1.0 - cl.a) * (S2 + T2 * surf));
+  } else {
+    scatter(ro, rd, tA, tEnd, uAtmoSteps, jitA, S, T);
+    col = S + T * surf;
+  }
+  // one bad pixel would poison the whole bloom chain: keep every value finite
+  outColor = vec4(clamp(col, 0.0, 6e4), 1.0);
+}
+`;
+// ---- the same height field as the shader, in JS, so the camera can feel the ground ----
+const R = 600;
+function hu(x, y, z) {
+  x = Math.imul(x, 1597334673); y = Math.imul(y, 3812015801); z = Math.imul(z, 2798796415);
+  let h = (x ^ y ^ z) >>> 0;
+  h ^= h >>> 15; h = Math.imul(h, 2246822519) >>> 0;
+  h ^= h >>> 13; h = Math.imul(h, 3266489917) >>> 0;
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+const h1 = (x, y, z) => (hu(x, y, z) >>> 8) / 16777216;
+const q5 = f => f * f * f * (f * (f * 6 - 15) + 10);
+
+// returns [value, dx, dy, dz], value in [-1,1]
+function noised(x, y, z) {
+  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const ux = q5(fx), uy = q5(fy), uz = q5(fz);
+  const dux = 30 * fx * fx * (fx * (fx - 2) + 1), duy = 30 * fy * fy * (fy * (fy - 2) + 1), duz = 30 * fz * fz * (fz * (fz - 2) + 1);
+  const a = h1(ix, iy, iz), b = h1(ix + 1, iy, iz), c = h1(ix, iy + 1, iz), d = h1(ix + 1, iy + 1, iz);
+  const e = h1(ix, iy, iz + 1), g = h1(ix + 1, iy, iz + 1), h = h1(ix, iy + 1, iz + 1), k = h1(ix + 1, iy + 1, iz + 1);
+  const k1 = b - a, k2 = c - a, k3 = e - a, k4 = a - b - c + d, k5 = a - c - e + h, k6 = a - b - e + g, k7 = -a + b + c - d + e - g - h + k;
+  return [
+    -1 + 2 * (a + k1 * ux + k2 * uy + k3 * uz + k4 * ux * uy + k5 * uy * uz + k6 * uz * ux + k7 * ux * uy * uz),
+    2 * dux * (k1 + k4 * uy + k6 * uz + k7 * uy * uz),
+    2 * duy * (k2 + k5 * uz + k4 * ux + k7 * uz * ux),
+    2 * duz * (k3 + k6 * ux + k5 * uy + k7 * ux * uy)];
+}
+const noise = (x, y, z) => noised(x, y, z)[0];
+const sstep = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+function continent(qx, qy, qz) {
+  let sx = qx / 300 + 3.1, sy = qy / 300 + 7.7, sz = qz / 300 + 1.3, c = 0, a = 0.5;
+  for (let i = 0; i < 5; i++) {
+    c += a * noise(sx, sy, sz);
+    const nx = (-0.8 * sy - 0.6 * sz) * 2.02, ny = (0.8 * sx + 0.36 * sy - 0.48 * sz) * 2.02, nz = (0.6 * sx - 0.48 * sy + 0.64 * sz) * 2.02;
+    sx = nx; sy = ny; sz = nz; a *= 0.5;
+  }
+  return c + 0.04;
+}
+
+// height above sea level (km) under the direction p (any length)
+function terrain(p, oct = 10) {
+  const l = Math.hypot(p[0], p[1], p[2]), qx = p[0] / l * R, qy = p[1] / l * R, qz = p[2] / l * R;
+  const c = continent(qx, qy, qz);
+  const base = c > 0 ? c * 1.5 : c * 5;
+  if (c < -0.12) return base;
+  const land = sstep(-0.12, 0.10, c);
+  const mm = sstep(-0.25, 0.45, noise(qx / 110 + 40, qy / 110 + 40, qz / 110 + 40));
+  const mount = sstep(-0.03, 0.07, c) * mm * mm;
+  let sx = qx / 16, sy = qy / 16, sz = qz / 16, a = 0, b = 1, dx = 0, dy = 0, dz = 0;
+  for (let i = 0; i < 14; i++) {
+    const w = Math.min(1, Math.max(0, oct - i));
+    if (w <= 0) break;
+    const n = noised(sx, sy, sz);
+    const sa = Math.sqrt(n[0] * n[0] + 0.012), rg = 1 - sa, sm = 0.5 + 0.5 * n[0];
+    const k = w * 0.6 * (0.5 + (-2 * rg * n[0] / sa - 0.5) * 0.7);
+    dx += n[1] * k; dy += n[2] * k; dz += n[3] * k;
+    a += w * b * (sm + (rg * rg - sm) * 0.7) / (1 + dx * dx + dy * dy + dz * dz);
+    b *= 0.5;
+    const nx = (-0.8 * sy - 0.6 * sz) * 2, ny = (0.8 * sx + 0.36 * sy - 0.48 * sz) * 2, nz = (0.6 * sx - 0.48 * sy + 0.64 * sz) * 2;
+    sx = nx; sy = ny; sz = nz;
+  }
+  return base + land * ((0.25 + 4.6 * mount) * a - 0.2);
+}
+
+// landing site, chosen by tools/findsite.mjs
+const SITE = [0.5093252224000714,0.37966002934138005,-0.7722992165913548];
+const HEAD = [-0.7672550890017055,-0.20610862354156037,-0.6073210548818381];
+
+// ---- the scripted dive: one unbroken move from orbit to the wave tops ----
+const vadd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const vsub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vmul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const vdot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vcross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const vlen = a => Math.hypot(a[0], a[1], a[2]);
+const vnorm = a => vmul(a, 1 / vlen(a));
+const clamp01 = x => Math.min(1, Math.max(0, x));
+const mix = (a, b, t) => a + (b - a) * t;
+const ease5 = x => { x = clamp01(x); return x * x * x * (x * (x * 6 - 15) + 10); };
+// rotate v around unit axis k
+const vrot = (v, k, a) => { const c = Math.cos(a), s = Math.sin(a); return vadd(vadd(vmul(v, c), vmul(vcross(k, v), s)), vmul(k, vdot(k, v) * (1 - c))); };
+
+// monotone cubic through (xs, ys): no overshoot between keys
+function pchip(xs, ys) {
+  const n = xs.length, d = [], m = new Array(n);
+  for (let i = 0; i < n - 1; i++) d.push((ys[i + 1] - ys[i]) / (xs[i + 1] - xs[i]));
+  m[0] = 0; m[n - 1] = 0;
+  for (let i = 1; i < n - 1; i++) m[i] = d[i - 1] * d[i] <= 0 ? 0 : 2 * d[i - 1] * d[i] / (d[i - 1] + d[i]);
+  return x => {
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    let i = 0; while (x > xs[i + 1]) i++;
+    const h = xs[i + 1] - xs[i], t = (x - xs[i]) / h, t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h * m[i] + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h * m[i + 1];
+  };
+}
+
+const TUNE = {
+  cine: 24,          // seconds of scripted camera
+  // altitude keys: [seconds, km above the sea]
+  altKeys: [[0, 1500], [0.7, 1470], [5, 420], [8, 60], [10, 12], [11.5, 5.2], [13.5, 2.4], [16, 0.9], [19, 0.3], [21.5, 0.2], [24, 0.2]],
+  alt0: 1500, alt1: 0.2,
+  phi0: 1.375, phiPow: 0.6,
+  swingFrom: 25, // km: above this the approach curves in from the sun's side
+  vEnd: 0.42, tSite: 26,
+  pitch0: -70, pitch1: -2.5, pitchPow: 1.6,
+  sunElev: 4.0, sunAz: -24,
+  mm0: 40, mm1: 22,
+};
+const altCurve = pchip(TUNE.altKeys.map(k => k[0]), TUNE.altKeys.map(k => Math.log(k[1])));
+const SIDE = vcross(HEAD, SITE);                      // right of travel at the site
+const SUN = (() => {
+  const e = TUNE.sunElev * Math.PI / 180, a = TUNE.sunAz * Math.PI / 180;
+  return vnorm(vadd(vadd(vmul(HEAD, Math.cos(e) * Math.cos(a)), vmul(SIDE, Math.cos(e) * Math.sin(a))), vmul(SITE, Math.sin(e))));
+})();
+
+function cineAlt(t) {
+  return Math.exp(altCurve(t));
+}
+function cinePos(t) {
+  const alt = cineAlt(t);
+  // max(0, ..): rounding in the curve can leave alt a hair under alt1, and a negative base would give NaN
+  const phi = TUNE.phi0 * Math.pow(Math.max(0, alt - TUNE.alt1) / (TUNE.alt0 - TUNE.alt1), TUNE.phiPow) + TUNE.vEnd * (TUNE.tSite - t) / R;
+  // high up, the approach plane is turned toward the sun; it swings onto the final heading on the way down
+  const sw = ease5(Math.log(alt / TUNE.swingFrom) / Math.log(TUNE.alt0 / TUNE.swingFrom));
+  const head = vrot(HEAD, SITE, -TUNE.sunAz * Math.PI / 180 * sw);
+  const up = vadd(vmul(SITE, Math.cos(phi)), vmul(head, -Math.sin(phi)));
+  const fwd = vadd(vmul(SITE, Math.sin(phi)), vmul(head, Math.cos(phi)));
+  return { alt, up, fwd, pos: vmul(up, R + alt) };
+}
+// where the dive crosses the cloud deck (top to bottom), as points on the sea-level sphere
+const HOLE = [6.6, 1.8].map(alt => {
+  let a = 0, b = TUNE.cine;
+  for (let i = 0; i < 40; i++) { const m = (a + b) / 2; if (cineAlt(m) > alt) a = m; else b = m; }
+  return vmul(cinePos(a).up, R);
+});
+let YAW0 = 0;
+YAW0 = (() => { const c = cinePos(0); return -Math.atan2(vdot(SUN, vcross(c.fwd, c.up)), vdot(SUN, c.fwd)); })();
+function cineView(t) {
+  const c = cinePos(t);
+  const s = (Math.log(c.alt) - Math.log(TUNE.alt1)) / (Math.log(TUNE.alt0) - Math.log(TUNE.alt1));
+  const pitch = (TUNE.pitch1 + (TUNE.pitch0 - TUNE.pitch1) * Math.pow(clamp01(s), TUNE.pitchPow)) * Math.PI / 180;
+  let fwd = vadd(vmul(c.fwd, Math.cos(pitch)), vmul(c.up, Math.sin(pitch)));
+  let right = vcross(c.fwd, c.up);
+  // open turned toward the sun, then swing onto the approach heading
+  const yaw = YAW0 * (1 - ease5((t - 1.5) / 6.5));
+  fwd = vrot(fwd, c.up, yaw);
+  // a slow bank through the dive, then level out
+  const b = Math.sin(Math.PI * clamp01((t - 4) / 11));
+  const roll = -0.30 * b * b + 0.004 * Math.sin(t * 1.3) + 0.003 * Math.sin(t * 2.9 + 1);
+  // hand-held drift: fractions of a degree
+  fwd = vrot(fwd, right, 0.003 * Math.sin(t * 0.9 + 2) + 0.0015 * Math.sin(t * 2.3));
+  fwd = vrot(fwd, c.up, 0.003 * Math.sin(t * 0.7) + 0.0015 * Math.sin(t * 1.9 + 4));
+  right = vnorm(vcross(fwd, c.up));
+  right = vrot(right, fwd, roll);
+  const up = vcross(right, fwd);
+  const mm = mix(TUNE.mm1, TUNE.mm0, Math.pow(clamp01(s), 0.8));
+  return { pos: c.pos, right, up, fwd, tanFov: 12 / mm, sun: SUN, time: t, alt: c.alt };
+}
+
+// free camera for look development: position relative to the landing site
+function debugView(aheadKm, sideKm, altKm, yawDeg, pitchDeg, mm) {
+  const a = aheadKm / R, b = sideKm / R;
+  const up = vnorm(vadd(vadd(vmul(SITE, Math.cos(a)), vmul(HEAD, Math.sin(a))), vmul(SIDE, b)));
+  let f = vnorm(vsub(HEAD, vmul(up, vdot(HEAD, up))));
+  f = vrot(f, up, -yawDeg * Math.PI / 180);
+  const r0 = vcross(f, up);
+  const fwd = vrot(f, r0, pitchDeg * Math.PI / 180);
+  const right = vnorm(vcross(fwd, up));
+  return { pos: vmul(up, R + altKm), right, up: vcross(right, fwd), fwd, tanFov: 12 / mm, sun: SUN, time: 20, alt: altKm };
+}
+
+// ---- WebGL2 plumbing: programs, HDR targets, bloom chain ----
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, powerPreference: 'high-performance', preserveDrawingBuffer: true });
+if (!gl || !gl.getExtension('EXT_color_buffer_float')) {
+  document.getElementById('err').textContent = 'This demo needs WebGL2 with float render targets.';
+  throw new Error('no webgl2 float targets');
+}
+
+const VS = `#version 300 es
+in vec2 a; out vec2 vUv;
+void main(){ vUv = a * 0.5 + 0.5; gl_Position = vec4(a, 0.0, 1.0); }`;
+const POST_HEAD = `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o; uniform sampler2D uTex; uniform vec2 uTexel;`;
+const FS_COPY = POST_HEAD + `void main(){ o = texture(uTex, vUv); }`;
+const FS_DOWN = POST_HEAD + `uniform float uFirst;
+vec3 s(vec2 d){ vec3 c = texture(uTex, vUv + d * uTexel).rgb; return uFirst > 0.5 ? min(c, vec3(220.0)) : c; }
+void main(){ o = vec4((s(vec2(0)) * 4.0 + s(vec2(1,1)) + s(vec2(-1,1)) + s(vec2(1,-1)) + s(vec2(-1,-1))) / 8.0, 1.0); }`;
+const FS_UP = POST_HEAD + `uniform float uGain;
+vec3 s(vec2 d){ return texture(uTex, vUv + d * uTexel).rgb; }
+void main(){ o = vec4((s(vec2(2,0)) + s(vec2(-2,0)) + s(vec2(0,2)) + s(vec2(0,-2))
+  + 2.0 * (s(vec2(1,1)) + s(vec2(-1,1)) + s(vec2(1,-1)) + s(vec2(-1,-1)))) / 12.0 * uGain, 1.0); }`;
+const FS_FINAL = POST_HEAD + `uniform sampler2D uBloom; uniform float uExposure, uSeed, uFade, uBloomScale;
+vec3 aces(vec3 x){ return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+float rnd(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+void main(){
+  vec2 d = vUv - 0.5;
+  // a hair of chromatic aberration toward the corners
+  vec3 c = vec3(texture(uTex, vUv - d * 0.0016).r, texture(uTex, vUv).g, texture(uTex, vUv + d * 0.0016).b);
+  vec3 b = texture(uBloom, vUv).rgb * uBloomScale;
+  c = mix(c, b, 0.05) + b * 0.03 * vec3(1.0, 0.82, 0.62);
+  c *= uExposure * (1.0 - 0.38 * dot(d, d) * 1.6);
+  c = aces(c);
+  // grade: a little more colour, a soft S-curve
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c = mix(vec3(l), c, 1.14);
+  c = mix(c, c * c * (3.0 - 2.0 * c), 0.22);
+  c = pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
+  c += (rnd(gl_FragCoord.xy + uSeed) - 0.5) * 0.018;
+  o = vec4(c * uFade, 1.0);
+}`;
+
+function program(vs, fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(s);
+      document.getElementById('err').textContent = log;
+      throw new Error(log);
+    }
+    gl.attachShader(p, s);
+  }
+  gl.bindAttribLocation(p, 0, 'a');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name] = gl.getUniformLocation(p, info.name); }
+  return { p, u };
+}
+
+const quad = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+function target(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fb, w, h };
+}
+function freeTarget(t) { if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } }
+
+// 64^3 volume of random bytes: four independent noise channels, built with the terrain hash
+function noiseVolume() {
+  const N = 64, data = new Uint8Array(N * N * N * 4);
+  let i = 0;
+  for (let z = 0; z < N; z++) for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+    const h = hu(x + 101, y + 211, z + 307);
+    data[i++] = h & 255; data[i++] = (h >>> 8) & 255; data[i++] = (h >>> 16) & 255; data[i++] = h >>> 24;
+  }
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_3D, tex);
+  gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, N, N, N, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  for (const w of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, w, gl.REPEAT);
+  return tex;
+}
+
+const P = {
+  scene: program(VS, SCENE_FS), copy: program(VS, FS_COPY),
+  down: program(VS, FS_DOWN), up: program(VS, FS_UP), final: program(VS, FS_FINAL),
+};
+const noiseTex = noiseVolume();
+let RT = null;   // { scene, accum, chain[] }
+
+function resizeTargets(w, h) {
+  if (RT && RT.scene.w === w && RT.scene.h === h) return;
+  if (RT) { freeTarget(RT.scene); freeTarget(RT.accum); RT.chain.forEach(freeTarget); }
+  const chain = [];
+  let cw = w, ch = h;
+  while (ch > 6 && chain.length < 9) { cw = Math.ceil(cw / 2); ch = Math.ceil(ch / 2); chain.push(target(cw, ch)); }
+  RT = { scene: target(w, h), accum: target(w, h), chain };
+}
+
+function pass(prog, dst, src, setup) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst ? dst.fb : null);
+  gl.viewport(0, 0, dst ? dst.w : canvas.width, dst ? dst.h : canvas.height);
+  gl.useProgram(prog.p);
+  if (src) {
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.uniform1i(prog.u.uTex, 0); gl.uniform2f(prog.u.uTexel, 1 / src.w, 1 / src.h);
+  }
+  if (setup) setup(prog.u);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// draw the scene `samples` times (jittered in space, optionally in time) and average
+function renderScene(view, opts) {
+  const { w, h, samples = 1, steps = 150, shadowSteps = 24, cloudSteps = 40, atmoSteps = 16, frame = 0, strips = 1 } = opts;
+  resizeTargets(w, h);
+  const multi = samples > 1;
+  if (multi) { gl.bindFramebuffer(gl.FRAMEBUFFER, RT.accum.fb); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+  for (let s = 0; s < samples; s++) {
+    const v = typeof view === 'function' ? view(samples > 1 ? (s + 0.5) / samples : 0.5) : view;
+    pass(P.scene, RT.scene, null, u => {
+      gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_3D, noiseTex); gl.uniform1i(u.uNoise, 1);
+      gl.uniform2f(u.uRes, w, h);
+      // Halton(2,3) sub-pixel offsets
+      let jx = 0, jy = 0;
+      if (multi) { let f = 0.5, i = s + 1; while (i) { jx += f * (i & 1); i >>= 1; f *= 0.5; } f = 1 / 3; i = s + 1; while (i) { jy += f * (i % 3); i = Math.floor(i / 3); f /= 3; } jx -= 0.5; jy -= 0.5; }
+      gl.uniform2f(u.uJitter, jx, jy);
+      gl.uniform3fv(u.uCamPos, v.pos);
+      gl.uniformMatrix3fv(u.uCam, false, [...v.right, ...v.up, ...v.fwd]);
+      gl.uniform1f(u.uTanFov, v.tanFov);
+      gl.uniform3fv(u.uSun, v.sun);
+      gl.uniform1f(u.uTime, v.time);
+      gl.uniform3fv(u.uHoleA, HOLE[0]); gl.uniform3fv(u.uHoleB, HOLE[1]);
+      gl.uniform1f(u.uPix, 2 * v.tanFov / h);
+      gl.uniform1f(u.uFrame, frame * 7 + s * 3);
+      gl.uniform1i(u.uSteps, steps); gl.uniform1i(u.uShadowSteps, shadowSteps); gl.uniform1i(u.uCloudSteps, cloudSteps); gl.uniform1i(u.uAtmoSteps, atmoSteps);
+      // optional: draw in horizontal bands, handing the GPU back between them
+      if (strips > 1) {
+        const y = i => Math.floor(h * i / strips);
+        gl.enable(gl.SCISSOR_TEST);
+        for (let i = 0; i < strips - 1; i++) { gl.scissor(0, y(i), w, y(i + 1) - y(i)); gl.drawArrays(gl.TRIANGLES, 0, 3); gl.flush(); }
+        gl.scissor(0, y(strips - 1), w, h - y(strips - 1));
+      }
+    });
+    gl.disable(gl.SCISSOR_TEST);
+    if (multi) {
+      gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1 / samples); gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE);
+      pass(P.copy, RT.accum, RT.scene);
+      gl.disable(gl.BLEND);
+    }
+  }
+  return multi ? RT.accum : RT.scene;
+}
+
+const BLOOM_GAIN = 0.78;   // each wider bloom level counts a little less: hot core, long faint tail
+// log-average scene luminance, read back from the smallest bloom level
+const meterBuf = new Float32Array(4096);
+function meter(t) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, t.fb);
+  gl.readPixels(0, 0, t.w, t.h, gl.RGBA, gl.FLOAT, meterBuf);
+  let s = 0; const n = Math.min(1024, t.w * t.h);
+  for (let i = 0; i < n; i++) s += Math.log(0.2126 * meterBuf[i * 4] + 0.7152 * meterBuf[i * 4 + 1] + 0.0722 * meterBuf[i * 4 + 2] + 0.004);
+  return Math.exp(s / n);
+}
+
+// exposure(avg) picks the exposure once the frame has been metered
+function present(hdr, exposure, fade, seed) {
+  const c = RT.chain;
+  pass(P.down, c[0], hdr, u => gl.uniform1f(u.uFirst, 1));
+  for (let i = 1; i < c.length; i++) pass(P.down, c[i], c[i - 1], u => gl.uniform1f(u.uFirst, 0));
+  if (typeof exposure === 'function') exposure = exposure(meter(c[c.length - 1]));
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  for (let i = c.length - 1; i > 0; i--) pass(P.up, c[i - 1], c[i], u => gl.uniform1f(u.uGain, BLOOM_GAIN));
+  gl.disable(gl.BLEND);
+  pass(P.final, null, hdr, u => {
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, c[0].tex); gl.uniform1i(u.uBloom, 2);
+    gl.uniform1f(u.uExposure, exposure); gl.uniform1f(u.uBloomScale, (1 - BLOOM_GAIN) / (1 - Math.pow(BLOOM_GAIN, c.length)));
+    gl.uniform1f(u.uSeed, seed); gl.uniform1f(u.uFade, fade);
+  });
+}
+
+// ---- flight: the dive hands over to this at TUNE.cine. Same model for the autopilot and the player. ----
+const FILE_KB = 64;
+const FLY = {
+  base: 0.40, boost: 0.80, slow: 0.16,   // km/s at sea level; scaled up with altitude so high flight still moves
+  rollRate: 1.9, pitchRate: 0.62, turn: 0.42, maxBank: 1.25,
+  floor: 0.035, dt: 1 / 120,
+};
+const NORTH = [0, 1, 0];
+const ground = p => Math.max(0, terrain(p, 9));
+
+// camera frame for a craft at pos, flying along fwd, banked by `bank` radians (right wing down = positive)
+function frameOf(pos, fwd, bank) {
+  const up0 = vnorm(pos);
+  const rh = vnorm(vcross(fwd, up0));
+  const lift = vcross(rh, fwd);
+  const right = vadd(vmul(rh, Math.cos(bank)), vmul(lift, -Math.sin(bank)));
+  return { up0, rh, right, up: vcross(right, fwd) };
+}
+
+// the highest summit in the right-hand sector of the landing site: where the autopilot turns to
+const PEAK = (() => {
+  let best = -1, at = SITE;
+  for (let i = 0; i < 48; i++) for (let j = 0; j < 40; j++) {
+    const az = (20 + 70 * i / 47) * Math.PI / 180, d = (5 + 22 * j / 39) / R;
+    const dir = vadd(vmul(HEAD, Math.cos(az)), vmul(SIDE, Math.sin(az)));
+    const p = vadd(vmul(SITE, Math.cos(d)), vmul(dir, Math.sin(d)));
+    const h = terrain(p, 6);
+    if (h > best) { best = h; at = p; }
+  }
+  return vnorm(at);
+})();
+
+function flightStart() {
+  const v = cineView(TUNE.cine), f = frameOf(v.pos, v.fwd, 0);
+  return {
+    pos: v.pos, fwd: v.fwd, bank: Math.atan2(-vdot(v.right, vcross(f.rh, v.fwd)), vdot(v.right, f.rh)),
+    speed: FLY.base * (1 + TUNE.alt1 / 4), thr: 0, pull: 0, in: { pitch: 0, roll: 0, boost: 0 },
+  };
+}
+
+// what the autopilot wants at tau seconds after the handover: bank toward the summit, hold height, then light the burner
+function autopilot(s, tau) {
+  const f = frameOf(s.pos, s.fwd, 0);
+  const to = vsub(PEAK, vmul(f.up0, vdot(PEAK, f.up0)));
+  const flat = vnorm(vsub(s.fwd, vmul(f.up0, vdot(s.fwd, f.up0))));
+  // aim a little left of the summit so it sits right of centre
+  const bearing = Math.atan2(vdot(to, f.rh), vdot(to, flat)) - 0.36;
+  const wantBank = tau < 1.3 ? 0 : Math.max(-0.72, Math.min(0.72, bearing * 2.0));
+  const alt = vlen(s.pos) - R, wantAlt = 0.2 + 0.05 * clamp01((tau - 6) / 4);
+  const wantPitch = Math.max(-0.08, Math.min(0.12, (wantAlt - alt) * 1.6));
+  const pitch = Math.asin(vdot(s.fwd, f.up0));
+  return {
+    roll: Math.max(-0.42, Math.min(0.42, (wantBank - s.bank) * 1.8)),
+    // pull a little while banked: the turn tightens and the nose stays up
+    pitch: Math.max(-1, Math.min(1, (wantPitch - pitch) * 4 + 0.35 * Math.abs(Math.sin(s.bank)))),
+    boost: tau > 6.2 ? 1 : 0,
+  };
+}
+
+// advance the craft by dt with stick input (pitch, roll in [-1,1], boost in [-1,1])
+function flightStep(s, inp, dt) {
+  const f0 = frameOf(s.pos, s.fwd, s.bank);
+  // stick response is smoothed, so key taps do not snap the horizon
+  const k = 1 - Math.exp(-dt * 7);
+  s.in.pitch += (inp.pitch - s.in.pitch) * k; s.in.roll += (inp.roll - s.in.roll) * k; s.in.boost += (inp.boost - s.in.boost) * (1 - Math.exp(-dt * 1.6));
+  s.bank += s.in.roll * FLY.rollRate * dt;
+  // hands off: the wings level themselves
+  if (Math.abs(inp.roll) < 0.05) s.bank *= Math.exp(-dt * 0.9);
+  s.bank = Math.max(-FLY.maxBank, Math.min(FLY.maxBank, s.bank));
+  let fwd = vrot(s.fwd, f0.right, s.in.pitch * FLY.pitchRate * dt);
+  fwd = vrot(fwd, f0.up0, -Math.sin(s.bank) * FLY.turn * dt);
+  // terrain assist: look ahead and lift the nose before the ground arrives
+  const alt = vlen(s.pos) - R, climb = vdot(fwd, f0.up0);
+  let need = 0;
+  for (const look of [0.5, 1.4, 3.2]) {
+    const d = s.speed * look, g = ground(vadd(s.pos, vmul(fwd, d)));
+    need = Math.max(need, (g + FLY.floor + 0.02 * look - (alt + climb * d)) / d);
+  }
+  s.pull += ((need > 0 ? 1 : 0) - s.pull) * (1 - Math.exp(-dt * 5));
+  if (need > 0) fwd = vrot(fwd, f0.rh, Math.min(1.4, need * 5) * dt);
+  // stay inside the air
+  if (alt > 45 && climb > 0) fwd = vrot(fwd, f0.rh, -climb * 2 * dt);
+  // the nose stops at 62 degrees up or down, so there is always a horizon to fly by
+  const c = vdot(fwd, f0.up0);
+  if (Math.abs(c) > 0.88) fwd = vadd(vmul(vnorm(vsub(fwd, vmul(f0.up0, c))), 0.475), vmul(f0.up0, 0.88 * Math.sign(c)));
+  s.fwd = vnorm(fwd);
+  const want = (s.in.boost >= 0 ? mix(FLY.base, FLY.boost, s.in.boost) : mix(FLY.base, FLY.slow, -s.in.boost)) * (1 + Math.max(0, alt) / 4);
+  s.speed += (want - s.speed) * (1 - Math.exp(-dt * 2.2));
+  s.thr = s.in.boost;
+  let pos = vadd(s.pos, vmul(s.fwd, s.speed * dt));
+  const g = ground(pos), a = vlen(pos) - R;
+  if (a < g + 0.012) {
+    pos = vmul(vnorm(pos), R + g + 0.012);
+    const u = vnorm(pos), c = vdot(s.fwd, u);
+    if (c < 0.02) s.fwd = vnorm(vadd(s.fwd, vmul(u, 0.02 - c)));
+  }
+  s.pos = pos;
+  return s;
+}
+
+function flightCam(s, t, extra) {
+  const f = frameOf(s.pos, s.fwd, s.bank);
+  const up0 = f.up0, alt = vlen(s.pos) - R;
+  const flat = vnorm(vsub(s.fwd, vmul(up0, vdot(s.fwd, up0))));
+  const north = vnorm(vsub(NORTH, vmul(up0, vdot(NORTH, up0)))), east = vcross(NORTH, up0);
+  // the lens opens up with the burner
+  const mm = TUNE.mm1 - 3.5 * Math.max(0, s.thr);
+  return {
+    pos: s.pos, right: f.right, up: f.up, fwd: s.fwd, tanFov: 12 / mm, sun: SUN, time: t, alt,
+    hud: {
+      alt, agl: alt - ground(s.pos), speed: s.speed, bank: s.bank, pitch: Math.asin(vdot(s.fwd, up0)),
+      heading: (Math.atan2(vdot(flat, east), vdot(flat, north)) * 180 / Math.PI + 360) % 360,
+      in: { ...s.in }, pull: s.pull, ...extra,
+    },
+  };
+}
+
+// the autopilot's run is simulated once at a fixed step, so any frame of the film can be drawn on its own
+const AUTO = (() => {
+  const run = [], s = flightStart();
+  for (let i = 0; i <= 14 / FLY.dt; i++) {
+    const inp = autopilot(s, i * FLY.dt);
+    run.push({ pos: s.pos, fwd: s.fwd, bank: s.bank, speed: s.speed, thr: s.thr, pull: s.pull, in: { ...s.in }, want: inp });
+    flightStep(s, inp, FLY.dt);
+  }
+  return run;
+})();
+
+function flightView(t) {
+  const x = Math.min(AUTO.length - 1.001, Math.max(0, (t - TUNE.cine) / FLY.dt)), i = Math.floor(x), k = x - i;
+  const a = AUTO[i], b = AUTO[i + 1], l = (p, q) => mix(p, q, k);
+  const s = {
+    pos: vadd(vmul(a.pos, 1 - k), vmul(b.pos, k)), fwd: vnorm(vadd(vmul(a.fwd, 1 - k), vmul(b.fwd, k))),
+    bank: l(a.bank, b.bank), speed: l(a.speed, b.speed), thr: l(a.thr, b.thr), pull: l(a.pull, b.pull),
+    in: { pitch: l(a.in.pitch, b.in.pitch), roll: l(a.in.roll, b.in.roll), boost: l(a.in.boost, b.in.boost) },
+  };
+  return flightCam(s, t, { auto: true, tau: t - TUNE.cine, keys: a.want });
+}
+
+// telemetry for the dive, so the altitude ribbon can run from the first frame
+function cineHud(t) {
+  const c = cinePos(t), d = cinePos(t + 0.02);
+  return { alt: c.alt, speed: vlen(vsub(d.pos, c.pos)) / 0.02, cine: true, tau: t - TUNE.cine };
+}
+
+// ---- HUD: lines and a stroke alphabet drawn by hand below. No fonts are loaded. ----
+const hud = document.getElementById('hud'), hx = hud.getContext('2d');
+let DIM = 1;   // the instruments fade with the picture at the end of the film; the closing card does not
+const INK = a => `rgba(244,238,226,${a * DIM})`, AMBER = a => `rgba(255,190,104,${a * DIM})`;
+const CREDIT = 'WRITTEN BY CLAUDE FABLE 5.2';
+// each glyph: strokes of xy pairs on a 5 x 7 grid (x 0-4, y 0-6 up from the baseline); a lone pair is a dot
+const GLYPHS = {
+  0: '103041453616050110', 1: '152620 1030', 2: '05163645440040', 3: '064623334241301001', 4: '30360242',
+  5: '460603334241301001', 6: '36160501103041423303', 7: '064610', 8: '13040516364544331302011030414233',
+  9: '43130405163645413010', A: '0004264440 0242', B: '00063645443303 3342413000', C: '4536160501103041',
+  D: '00063645413000', E: '40000646 0333', F: '000646 0333', G: '45361605011030414323', H: '0006 4046 0343',
+  I: '2026 1030 1636', J: '4641301001', K: '0006 460340', L: '060040', M: '0006234640', N: '00064046',
+  O: '103041453616050110', P: '00063645443303', Q: '103041453616050110 2240', R: '00063645443303 2340',
+  S: '453616050413334241301001', T: '0646 2620', U: '060110304146', V: '062046', W: '0610233046', X: '0046 0640',
+  Y: '062346 2320', Z: '06460040', '-': '1333', '/': '0046', '+': '1333 2224', '.': '10', '·': '13', ':': '11 14',
+};
+const NARROW = ' .·:';
+const adv = c => NARROW.includes(c) ? 3.6 : 6.3;
+function textWidth(str, cap) { let w = 0; for (const c of str) w += adv(c); return (w - 2.3) * cap / 6; }
+// draw str with its baseline at y; align 0 = left, 0.5 = centred, 1 = right
+function text(str, x, y, cap, align, color, weight = 1) {
+  const k = cap / 6;
+  x -= textWidth(str, cap) * align;
+  const lw = Math.max(1, cap / 8.5) * weight, dots = [];
+  hx.beginPath();
+  for (const c of str) {
+    for (const s of (GLYPHS[c] || '').split(' ')) {
+      if (s.length === 2) dots.push(x + s[0] * k, y - s[1] * k);
+      else for (let i = 0; i < s.length; i += 2) hx[i ? 'lineTo' : 'moveTo'](x + s[i] * k, y - s[i + 1] * k);
+    }
+    x += adv(c) * k;
+  }
+  hx.strokeStyle = color; hx.lineWidth = lw; hx.stroke();
+  hx.fillStyle = color; hx.beginPath();
+  for (let i = 0; i < dots.length; i += 2) { hx.moveTo(dots[i], dots[i + 1]); hx.arc(dots[i], dots[i + 1] - lw * 0.4, lw * 0.95, 0, 7); }
+  hx.fill();
+}
+function line(x0, y0, x1, y1, color, w) { hx.beginPath(); hx.moveTo(x0, y0); hx.lineTo(x1, y1); hx.strokeStyle = color; hx.lineWidth = w; hx.stroke(); }
+const altText = a => a >= 100 ? Math.round(a) + ' KM' : a >= 10 ? a.toFixed(1) + ' KM' : a >= 1 ? a.toFixed(2) + ' KM' : Math.round(a * 1000) + ' M';
+
+function drawHud(v, t, W, H, o = {}) {
+  hx.setTransform(1, 0, 0, 1, 0, 0); hx.clearRect(0, 0, W, H);
+  const h = v.hud || cineHud(t), u = Math.min(H / 720, W / 900), cx = W / 2, cy = H / 2;
+  hx.lineCap = hx.lineJoin = 'round'; DIM = o.dim == null ? 1 : o.dim;
+  hx.shadowColor = 'rgba(0,0,0,0.75)'; hx.shadowBlur = 5 * u;
+  const on = (delay, dur = 0.7) => h.cine ? 0 : o.live && !h.auto ? 1 : ease5((h.tau - delay) / dur);
+
+  // -- altitude ribbon: orbit to sea level on one log scale, present for the whole film --
+  const A0 = clamp01((t - 2.6) / 1.4) * (1 - 0.5 * clamp01((h.tau - 6.4) / 0.8) * (h.auto ? 1 : 0));
+  if (A0 > 0) {
+    const x = W - 44 * u, top = 150 * u, bot = 570 * u;
+    const ya = a => bot - Math.log10(Math.max(a, 0.05) / 0.05) / 4.6 * (bot - top);
+    const ym = ya(h.alt);
+    line(x, top, x, bot, INK(0.42 * A0), u);
+    // the cloud deck, as a heavier stretch of the scale
+    line(x, ya(5.6), x, ya(2.4), INK(0.55 * A0), 3.2 * u);
+    for (const a of [0.1, 1, 10, 100, 1000]) {
+      const y = ya(a), near = 1 - clamp01(1.6 - Math.abs(y - ym) / (16 * u));
+      line(x - 7 * u, y, x, y, INK(0.6 * A0), u);
+      text(String(a), x - 13 * u, y + 3.5 * u, 7 * u, 1, INK(0.5 * A0 * near));
+    }
+    text('KM', x, top - 12 * u, 7 * u, 0.5, INK(0.5 * A0));
+    hx.beginPath(); hx.moveTo(x - 3 * u, ym); hx.lineTo(x - 13 * u, ym - 5.5 * u); hx.lineTo(x - 13 * u, ym + 5.5 * u); hx.closePath();
+    hx.fillStyle = AMBER(0.95 * A0); hx.fill();
+    text(altText(h.alt), x - 22 * u, ym + 7.5 * u, 15 * u, 1, INK(0.95 * A0));
+  }
+  if (o.live && h.cine && t > 1.2) text('ENTER OR TAP · SKIP THE DIVE', 40 * u, H - 40 * u, 7.5 * u, 0, INK(0.5 * clamp01(t - 1.2)));
+  if (h.cine) return;
+
+  // -- horizon and pitch ladder, true to the lens: the line sits on the real horizon --
+  const ppr = H / 2 / v.tanFov, RAD = Math.PI / 180;
+  let A = on(0.15);
+  const dip = Math.acos(R / (R + Math.max(0, h.alt)));   // the sea horizon sits this far below level
+  hx.save(); hx.translate(cx, cy); hx.rotate(-h.bank);
+  for (let d = -85; d <= 85; d += 5) {
+    const off = Math.tan(d * RAD - (d ? 0 : dip) - h.pitch) * ppr;
+    if (Math.abs(d * RAD - h.pitch) > 0.6 || Math.abs(off) > 215 * u) continue;
+    const a = A * (1 - clamp01((Math.abs(off) - 120 * u) / (95 * u))) * (d ? 0.72 : 0.9);
+    const a0 = (d ? 54 : 70) * u, a1 = a0 + (d ? 44 : 250 * on(0.15, 1.1)) * u;
+    hx.setLineDash(d < 0 ? [5 * u, 5 * u] : []);
+    for (const s of [-1, 1]) {
+      line(s * a0, -off, s * a1, -off, INK(a), (d ? 1.1 : 1.4) * u);
+      if (d) line(s * a0, -off, s * a0, -off + Math.sign(d) * 5 * u, INK(a), 1.1 * u);
+    }
+    hx.setLineDash([]);
+    if (d) for (const s of [-1, 1]) text(String(Math.abs(d)), s * (a1 + 13 * u), -off + 4 * u, 8 * u, 0.5, INK(a));
+  }
+  hx.restore();
+  // where the nose points
+  A = on(0);
+  hx.beginPath(); hx.arc(cx, cy, 6.5 * u, 0, 7);
+  for (const s of [-1, 1]) { hx.moveTo(cx + s * 6.5 * u, cy); hx.lineTo(cx + s * (6.5 + 17 * A) * u, cy); }
+  hx.moveTo(cx, cy - 6.5 * u); hx.lineTo(cx, cy - 12.5 * u);
+  hx.strokeStyle = AMBER(A); hx.lineWidth = 1.7 * u; hx.stroke();
+  if (h.pull > 0.25) text('TERRAIN', cx, cy + 64 * u, 9 * u, 0.5, AMBER(clamp01(h.pull * 2 - 0.5)));
+
+  // -- heading tape --
+  A = on(0.3);
+  const hy = 58 * u, span = 38, step = 4.4 * u;
+  for (let d = Math.ceil((h.heading - span) / 5) * 5; d <= h.heading + span; d += 5) {
+    const e = (d - h.heading) / span, a = A * (1 - e * e) * 0.75, x = cx + (d - h.heading) * step, dd = (d + 360) % 360;
+    line(x, hy, x, hy + (dd % 15 ? 5 : 9) * u, INK(a), 1.1 * u);
+    if (dd % 30 === 0) text({ 0: 'N', 90: 'E', 180: 'S', 270: 'W' }[dd] || String(dd / 10).padStart(2, '0'), x, hy - 7 * u, 8 * u, 0.5, INK(a));
+  }
+  hx.beginPath(); hx.moveTo(cx, hy + 13 * u); hx.lineTo(cx - 5 * u, hy + 21 * u); hx.lineTo(cx + 5 * u, hy + 21 * u); hx.closePath();
+  hx.fillStyle = AMBER(A); hx.fill();
+
+  // -- speed --
+  A = on(0.4);
+  const sx = Math.max(cx - 300 * u, 150 * u);
+  text(String(Math.round(h.speed * 1000)), sx, cy + 11 * u, 22 * u, 1, INK(0.95 * A));
+  text('M/S', sx, cy + 30 * u, 7.5 * u, 1, INK(0.55 * A));
+  if (h.in.boost > 0.08) line(sx - 62 * u, cy + 42 * u, sx - 62 * u + 62 * u * clamp01(h.in.boost), cy + 42 * u, AMBER(0.9 * A), 2 * u);
+
+  // -- the keys: lit by whoever is flying, autopilot or player --
+  A = on(0.6) * (h.auto ? 1 - clamp01((h.tau - 6.2) / 0.6) * (o.live ? 0 : 1) : 1 - 0.55 * clamp01(((h.since || 0) - 7) / 2));
+  const k = h.keys || h.in, bx = 44 * u, by = H - 44 * u, cs = 22 * u;
+  const key = (x, y, w, label, lit) => {
+    hx.beginPath(); hx.roundRect ? hx.roundRect(x, y - cs, w, cs, 4 * u) : hx.rect(x, y - cs, w, cs);
+    if (lit) { hx.fillStyle = INK(0.92 * A); hx.fill(); } else { hx.fillStyle = `rgba(12,14,22,${0.4 * A * DIM})`; hx.fill(); hx.strokeStyle = INK(0.75 * A); hx.lineWidth = 1.2 * u; hx.stroke(); }
+    hx.save(); if (lit) hx.shadowColor = 'transparent';
+    text(label, x + w / 2, y - cs / 2 + 4 * u, 8 * u, 0.5, lit ? `rgba(22,26,34,${A * DIM})` : INK(0.85 * A));
+    hx.restore();
+  };
+  if (A > 0.01) {
+    // a soft shade behind the corner, so the keys read over a bright sky
+    const g = hx.createRadialGradient(bx + 80 * u, by - 22 * u, 8 * u, bx + 80 * u, by - 22 * u, 210 * u);
+    g.addColorStop(0, `rgba(8,10,18,${0.36 * A * DIM})`); g.addColorStop(1, 'rgba(8,10,18,0)');
+    hx.save(); hx.shadowColor = 'transparent'; hx.fillStyle = g; hx.fillRect(0, by - 240 * u, bx + 300 * u, 300 * u); hx.restore();
+    key(bx + 26 * u, by - 26 * u, cs, 'W', k.pitch < -0.25); key(bx, by, cs, 'A', k.roll < -0.25);
+    key(bx + 26 * u, by, cs, 'S', k.pitch > 0.25); key(bx + 52 * u, by, cs, 'D', k.roll > 0.25);
+    key(bx + 88 * u, by, 58 * u, 'SHIFT', k.boost > 0.5);
+    if (h.auto) { text('AUTOPILOT', bx + 88 * u, by - 39 * u, 8.5 * u, 0, AMBER(A)); text('PRESS ANY KEY TO FLY', bx + 88 * u, by - 28 * u + 0.5 * u, 6.5 * u, 0, INK(0.8 * A)); }
+    else text('W S PITCH · A D ROLL · SHIFT BOOST · SPACE SLOW · R RESTART', bx + 160 * u, by - 7 * u, 6.5 * u, 0, INK(0.5 * A * (1 - clamp01(((h.since || 0) - 7) / 2))));
+  }
+
+  // -- closing card, while the autopilot still has it --
+  DIM = 1;
+  if (h.auto && h.tau > 6.6) {
+    const c = i => ease5((h.tau - 6.8 - i * 0.22) / 0.7), y = mix(H - 104 * u, H / 2 - 8 * u, ease5(1 - (o.dim == null ? 1 : o.dim)));
+    text('ONE HTML FILE · ' + FILE_KB + ' KB', cx, y - 6 * u * (1 - c(0)), 21 * u, 0.5, INK(c(0)), 1.15);
+    text('NO TEXTURES · NO MODELS · NO LIBRARIES', cx, y + 26 * u, 10.5 * u, 0.5, INK(0.85 * c(1)));
+    text(CREDIT, cx, y + 47 * u, 8 * u, 0.5, AMBER(0.95 * c(2)));
+  }
+}
+
+// ---- app: quality presets, the frame function, the live loop ----
+const Q = new URLSearchParams(location.search);
+const QUALITY = {
+  live: { steps: 110, shadowSteps: 16, cloudSteps: 28 },
+  high: { steps: 260, shadowSteps: 40, cloudSteps: 72 },
+  film: { steps: 260, shadowSteps: 40, cloudSteps: 144 },
+};
+
+// auto exposure: pull the metered average toward a key, but only part of the way,
+// so space stays dark and a sunset stays bright
+const EXPO = { key: 0.21, power: 0.8, lo: 0.06, hi: 1.3, avg: 0, value: 1 };
+function autoExposure(avg) {
+  EXPO.avg = avg;
+  EXPO.value = Math.min(EXPO.hi, Math.max(EXPO.lo, EXPO.key / Math.pow(avg, EXPO.power)));
+  return EXPO.value;
+}
+
+// the camera at time t: scripted first, then the flight model
+const FILM = { length: 36, fadeOut: 33.5 };
+let DEBUG_VIEW = null;
+function viewAt(t) { if (DEBUG_VIEW) return DEBUG_VIEW; return t <= TUNE.cine || !window.flightView ? cineView(Math.min(t, TUNE.cine)) : flightView(t); }
+
+// render one finished frame at time t (seconds). shutter > 0 averages sub-frames across that many seconds.
+function drawFrame(t, o = {}) {
+  const w = o.w || canvas.width, h = o.h || canvas.height;
+  const q = QUALITY[o.quality || 'live'];
+  const samples = o.samples || 1, shutter = o.shutter || 0;
+  // the film fades up and back down to black; the closing card stays on.
+  // The first frame is already half lit: a feed shows it as the still before the video plays.
+  const fade = clamp01(0.5 + t / 0.5) * (1 - ease5((t - FILM.fadeOut) / 0.9));
+  if (fade > 0) {
+    const hdr = renderScene(samples > 1 && shutter > 0 ? s => viewAt(t + (s - 0.5) * shutter) : viewAt(t),
+      { w, h, samples, frame: Math.round(t * 60), strips: o.strips, ...q });
+    present(hdr, avg => autoExposure(avg) * (o.exposure || 1), fade * fade, (t * 60) % 977);
+  } else {
+    // fully faded: nothing of the scene shows, so don't render it
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, w, h); gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  const hw = o.hw || w, hh = o.hh || h;
+  hud.width = hw; hud.height = hh;
+  if (!DEBUG_VIEW && !o.noHud) drawHud(viewAt(t), t, hw, hh, { dim: 1 - ease5((t - FILM.fadeOut) / 0.9) });
+}
+
+// used by the still / capture tools
+// hw x hh: size of the HUD layer when the picture is rendered smaller than the page; strips: draw in bands so the desktop stays responsive
+window.__shot = (t, w, h, quality, samples, shutter, hw, hh, strips) => {
+  window.__still = true;
+  canvas.width = w; canvas.height = h;
+  const t0 = performance.now();
+  drawFrame(t, { w, h, quality, samples, shutter, hw, hh, strips });
+  gl.finish();
+  // readPixels forces the GPU to really finish before we report a time
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+  return Math.round(performance.now() - t0);
+};
+window.__expo = () => EXPO.avg.toFixed(4) + ' -> ' + EXPO.value.toFixed(3);
+window.__info = () => { const e = gl.getExtension('WEBGL_debug_renderer_info'); return e ? gl.getParameter(e.UNMASKED_RENDERER_WEBGL) : 'unknown'; };
+window.__view = (...a) => { window.__still = true; DEBUG_VIEW = a.length ? debugView(...a) : null; };
+
+// ---- live: the loop, the controls, and a resolution that follows the frame rate ----
+(() => {
+  const keys = new Set();
+  let t = 0, last = 0, craft = null, simT = 0, manual = false, tookAt = 0, inp = null, stick = null;
+  let lastV = null, area = 240000, rw = 0, rh = 0, slow = 0, count = 0, expo = 0, frameNo = 0;
+
+  function fit() {
+    const d = Math.min(window.devicePixelRatio || 1, 2);
+    hud.width = Math.round(innerWidth * d); hud.height = Math.round(innerHeight * d);
+    const full = hud.width * hud.height, a = Math.min(area, full, 2.2e6);
+    rw = Math.max(64, Math.round(Math.sqrt(a * hud.width / hud.height) / 2) * 2); rh = Math.max(36, Math.round(rw * hud.height / hud.width / 2) * 2);
+    canvas.width = rw; canvas.height = rh;
+  }
+  addEventListener('resize', fit);
+
+  const FLYKEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'ShiftLeft', 'ShiftRight', 'Space'];
+  const takeOver = () => { if (craft && !manual) { manual = true; tookAt = t; } };
+  const skip = () => { if (t > 1 && t < TUNE.cine - 1.5) t = TUNE.cine - 1.2; };
+  addEventListener('keydown', e => {
+    if (e.code === 'Enter') skip();
+    if (e.code === 'KeyR') { t = 0; craft = null; manual = false; }
+    if (FLYKEYS.includes(e.code)) { keys.add(e.code); takeOver(); e.preventDefault(); }
+  });
+  addEventListener('keyup', e => keys.delete(e.code));
+  addEventListener('blur', () => keys.clear());
+  // drag anywhere = a stick: sideways rolls, pulling down lifts the nose
+  addEventListener('pointerdown', e => { skip(); stick = { x0: e.clientX, y0: e.clientY, x: 0, y: 0 }; if (e.pointerType !== 'mouse') takeOver(); });
+  addEventListener('pointermove', e => { if (stick) { stick.x = (e.clientX - stick.x0) / 70; stick.y = (e.clientY - stick.y0) / 70; if (Math.abs(stick.x) + Math.abs(stick.y) > 0.3) takeOver(); } });
+  addEventListener('pointerup', () => { stick = null; });
+  addEventListener('pointercancel', () => { stick = null; });
+  const c1 = x => Math.max(-1, Math.min(1, x));
+  const has = (...k) => k.some(c => keys.has(c)) ? 1 : 0;
+  const player = () => ({
+    pitch: c1(has('KeyS', 'ArrowDown') - has('KeyW', 'ArrowUp') + (stick ? stick.y : 0)),
+    roll: c1(has('KeyD', 'ArrowRight') - has('KeyA', 'ArrowLeft') + (stick ? stick.x : 0)),
+    boost: has('ShiftLeft', 'ShiftRight') - has('Space'),
+  });
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (window.__still) return;
+    const real = (now - last) / 1000; last = now;
+    const dt = Math.min(0.1, real > 0 ? real : 0.016);
+    // resolution chases 30 frames a second: shrink when slower, grow when there is headroom
+    if (real > 0 && real < 1) { slow += real; count++; }
+    if (count >= 8) {
+      const ms = slow / count * 1000; slow = 0; count = 0;
+      const next = ms > 38 ? area * Math.max(0.5, 33 / ms) : ms < 24 ? area * 1.18 : area;
+      area = Math.max(30000, Math.min(next, hud.width * hud.height, 2.2e6));
+      if (Math.abs(area / (rw * rh) - 1) > 0.1) fit();
+    }
+    t += dt;
+    let v;
+    if (t < TUNE.cine) v = cineView(t);
+    else {
+      if (!craft) { craft = flightStart(); simT = TUNE.cine; }
+      while (simT < t) { inp = manual ? player() : autopilot(craft, simT - TUNE.cine); flightStep(craft, inp, FLY.dt); simT += FLY.dt; }
+      v = flightCam(craft, t, { auto: !manual, tau: t - TUNE.cine, keys: inp, since: manual ? t - tookAt : 0 });
+    }
+    lastV = v;
+    const hdr = renderScene(v, { w: rw, h: rh, frame: frameNo++, ...QUALITY.live });
+    const fade = clamp01(t / 0.6);
+    // exposure settles over about a third of a second, like an eye
+    present(hdr, avg => { const e = autoExposure(avg); expo = expo ? expo + (e - expo) * (1 - Math.exp(-dt * 3)) : e; return expo; }, fade * fade, frameNo % 977);
+    drawHud(v, t, hud.width, hud.height, { live: true });
+  }
+  window.__hold = () => { window.__still = true; DEBUG_VIEW = lastV; return lastV.hud; };
+  window.__live = () => ({ t: +t.toFixed(2), rw, rh, manual, area: Math.round(area) });
+  if (!Q.has('still')) { fit(); requestAnimationFrame(frame); }
+})();
+
+</script>
+</body>
+</html>
